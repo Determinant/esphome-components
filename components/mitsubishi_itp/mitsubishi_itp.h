@@ -171,6 +171,11 @@ class MitsubishiUART : public PollingComponent, public climate::Climate, public 
   // Have we received at least one RunState response?
   bool run_state_received_ = false;
 
+  // The MHK can keep its user-facing mode in Auto while sending raw heat/cool settings packets to the heat pump for
+  // the active leg. Track that thermostat-level Auto state separately from the heat pump's current raw mode.
+  bool mhk_auto_mode_ = false;
+  climate::ClimateMode mhk_auto_active_mode_ = climate::CLIMATE_MODE_OFF;
+
 // Time Source
 #ifdef USE_TIME
   time::RealTimeClock *time_source_ = nullptr;

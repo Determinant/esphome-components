@@ -46,6 +46,8 @@ void MitsubishiUART::control(const climate::ClimateCall &call) {
 
   if (call.get_mode().has_value()) {
     mode = call.get_mode().value();
+    mhk_auto_mode_ = (mode == climate::CLIMATE_MODE_HEAT_COOL);
+    mhk_auto_active_mode_ = climate::CLIMATE_MODE_OFF;
 
     switch (call.get_mode().value()) {
       case climate::CLIMATE_MODE_HEAT_COOL:

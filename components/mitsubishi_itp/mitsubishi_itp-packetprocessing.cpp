@@ -3,6 +3,14 @@
 namespace esphome {
 namespace mitsubishi_itp {
 
+static bool is_heat_mode(const uint8_t raw_mode) { return raw_mode == 0x01 || raw_mode == 0x09; }
+
+static bool is_cool_mode(const uint8_t raw_mode) { return raw_mode == 0x03 || raw_mode == 0x0B; }
+
+static bool is_auto_mode(const uint8_t raw_mode) {
+  return raw_mode == 0x08 || raw_mode == 0x21 || raw_mode == 0x23;
+}
+
 void MitsubishiUART::route_packet_(const Packet &packet) {
   // If the packet is associated with the thermostat and just came from the thermostat, send it to the heatpump
   // If it came from the heatpump, send it back to the thermostat
@@ -100,8 +108,9 @@ void MitsubishiUART::process_packet(const SettingsGetResponsePacket &packet) {
   // Mode
 
   const climate::ClimateMode old_mode = mode;
+  const uint8_t raw_mode = packet.get_mode();
   if (packet.get_power()) {
-    switch (packet.get_mode()) {
+    switch (raw_mode) {
       case 0x01:
       case 0x09:  // i-see
         mode = climate::CLIMATE_MODE_HEAT;
@@ -130,25 +139,53 @@ void MitsubishiUART::process_packet(const SettingsGetResponsePacket &packet) {
     mode = climate::CLIMATE_MODE_OFF;
   }
 
+  bool mhk_auto_active_leg = false;
+  if (!packet.get_power()) {
+    mhk_auto_mode_ = false;
+    mhk_auto_active_mode_ = climate::CLIMATE_MODE_OFF;
+  } else if (is_auto_mode(raw_mode)) {
+    mhk_auto_mode_ = true;
+    mhk_auto_active_mode_ = climate::CLIMATE_MODE_OFF;
+  } else if (mhk_auto_mode_ && is_heat_mode(raw_mode)) {
+    mode = climate::CLIMATE_MODE_HEAT_COOL;
+    mhk_auto_active_mode_ = climate::CLIMATE_MODE_HEAT;
+    mhk_auto_active_leg = true;
+  } else if (mhk_auto_mode_ && is_cool_mode(raw_mode)) {
+    mode = climate::CLIMATE_MODE_HEAT_COOL;
+    mhk_auto_active_mode_ = climate::CLIMATE_MODE_COOL;
+    mhk_auto_active_leg = true;
+  } else {
+    mhk_auto_mode_ = false;
+    mhk_auto_active_mode_ = climate::CLIMATE_MODE_OFF;
+  }
+
   publish_on_update_ |= (old_mode != mode);
 
   // Temperature
   const float old_target_temperature = target_temperature;
-  target_temperature = packet.get_target_temp();
+  const bool keep_auto_target = mhk_auto_active_leg && !std::isnan(target_temperature);
+  if (!keep_auto_target) {
+    target_temperature = packet.get_target_temp();
+  }
   publish_on_update_ |= (old_target_temperature != target_temperature);
   if (mode <= MAX_RECALL_MODE_INDEX) {
     mode_recall_setpoints_[mode] = target_temperature;
   }
 
-  switch (mode) {
-    case climate::CLIMATE_MODE_COOL:
-    case climate::CLIMATE_MODE_DRY:
-      this->mhk_state_.cool_setpoint_ = target_temperature;
+  switch (raw_mode) {
+    case 0x02:
+    case 0x03:
+    case 0x0A:
+    case 0x0B:
+      this->mhk_state_.cool_setpoint_ = packet.get_target_temp();
       break;
-    case climate::CLIMATE_MODE_HEAT:
-      this->mhk_state_.heat_setpoint_ = target_temperature;
+    case 0x01:
+    case 0x09:
+      this->mhk_state_.heat_setpoint_ = packet.get_target_temp();
       break;
-    case climate::CLIMATE_MODE_HEAT_COOL:
+    case 0x08:
+    case 0x21:
+    case 0x23:
       this->mhk_state_.cool_setpoint_ = target_temperature + 2;
       this->mhk_state_.heat_setpoint_ = target_temperature - 2;
     default:
@@ -230,7 +267,11 @@ void MitsubishiUART::process_packet(const StatusGetResponsePacket &packet) {
       // TODO: This only works if we get an update while the temps are in this configuration
       // Surely there's some info from the heat pump about which of these modes it's in?
       case climate::CLIMATE_MODE_HEAT_COOL:
-        if (current_temperature > target_temperature) {
+        if (mhk_auto_active_mode_ == climate::CLIMATE_MODE_COOL) {
+          action = climate::CLIMATE_ACTION_COOLING;
+        } else if (mhk_auto_active_mode_ == climate::CLIMATE_MODE_HEAT) {
+          action = climate::CLIMATE_ACTION_HEATING;
+        } else if (current_temperature > target_temperature) {
           action = climate::CLIMATE_ACTION_COOLING;
         } else if (current_temperature < target_temperature) {
           action = climate::CLIMATE_ACTION_HEATING;
@@ -259,7 +300,11 @@ void MitsubishiUART::process_packet(const RunStateGetResponsePacket &packet) {
 
   run_state_received_ = true;  // Set this since we received one
 
-  // TODO: Not sure what AutoMode does yet
+  // AutoMode can return to 0 while the MHK is driving a raw heat/cool active leg, so use nonzero values only as
+  // positive confirmation. Thermostat state sync can explicitly clear MHK Auto.
+  if (packet.get_auto_mode() != 0) {
+    mhk_auto_mode_ = true;
+  }
 }
 
 void MitsubishiUART::process_packet(const ErrorStateGetResponsePacket &packet) {
@@ -346,6 +391,12 @@ void MitsubishiUART::process_packet(const ThermostatStateUploadPacket &packet) {
 
   // In Fahrenheit correction mode, we store the actual temp in mhk_state_ and only alter it just in time to
   // send/receive over the wire
+  if (packet.get_flags() & 0x04) {
+    mhk_auto_mode_ = packet.get_auto_mode() != 0;
+    if (!mhk_auto_mode_) {
+      mhk_auto_active_mode_ = climate::CLIMATE_MODE_OFF;
+    }
+  }
   if (packet.get_flags() & 0x08) {
     this->mhk_state_.heat_setpoint_ =
         mhk_f_correction_ ? mhk_temp_to_actual(packet.get_heat_setpoint()) : packet.get_heat_setpoint();
